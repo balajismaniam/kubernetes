@@ -25,7 +25,6 @@ import (
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	internalapi "k8s.io/kubernetes/pkg/kubelet/apis/cri"
 	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 	"k8s.io/kubernetes/pkg/kubelet/cpumanager/state"
 	"k8s.io/kubernetes/pkg/kubelet/cpumanager/topology"
@@ -38,8 +37,14 @@ type kletGetter interface {
 	GetNode() (*v1.Node, error)
 }
 
+type runtimeService interface {
+	UpdateContainerResources(id string, resources *runtimeapi.LinuxContainerResources) error
+}
+
+// PolicyName is the type of CPU Manager policy used.
 type PolicyName string
 
+// Manager is the CPU Manager interface for Kubelet.
 type Manager interface {
 	Start()
 
@@ -58,7 +63,8 @@ type Manager interface {
 	State() state.Reader
 }
 
-func NewManager(policyName PolicyName, cr internalapi.RuntimeService, kletGetter kletGetter, statusProvider status.PodStatusProvider) (Manager, error) {
+// NewManager instantiates a new CPU Manager.
+func NewManager(policyName PolicyName, cr runtimeService, kletGetter kletGetter, statusProvider status.PodStatusProvider) (Manager, error) {
 	var policy Policy
 
 	switch policyName {
@@ -77,7 +83,7 @@ func NewManager(policyName PolicyName, cr internalapi.RuntimeService, kletGetter
 
 		// Get node to figure out reserved CPUs
 		node, err := kletGetter.GetNode()
-		topo.NumReservedCores = getReserverdCpus(node.Status)
+		topo.NumReservedCores = getReservedCPUs(node.Status)
 		policy = NewStaticPolicy(topo)
 	default:
 		glog.Warningf("[cpumanager] Unknown policy (\"%s\"), falling back to \"%s\" policy (\"%s\")", policyName, PolicyNoop)
@@ -93,7 +99,7 @@ func NewManager(policyName PolicyName, cr internalapi.RuntimeService, kletGetter
 	}, nil
 }
 
-func getReserverdCpus(nodeStatus v1.NodeStatus) int {
+func getReservedCPUs(nodeStatus v1.NodeStatus) int {
 	// Reserved = ceiling(Capacity) - ceiling(Allocatable)
 	cpuCapacity := nodeStatus.Capacity[v1.ResourceCPU]
 	cpuAllocatable := nodeStatus.Allocatable[v1.ResourceCPU]
@@ -107,7 +113,7 @@ type manager struct {
 
 	// containerRuntime is the container runtime service interface needed
 	// to make UpdateContainerResources() calls against the containers.
-	containerRuntime internalapi.RuntimeService
+	containerRuntime runtimeService
 
 	// podLister provides a method for listing all the pods on the node
 	// so all the containers can be updated in the reconciliation loop.
@@ -174,19 +180,19 @@ func (m *manager) reconcileState() {
 		for _, container := range pod.Spec.Containers {
 			status, ok := m.podStatusProvider.GetPodStatus(pod.UID)
 			if !ok {
-				glog.Warningf("[cpumanager] reconcileState: skipping pod; status not found (pod: %s, container: %s)", pod.Name, container.Name)
+				glog.Errorf("[cpumanager] reconcileState: skipping pod; status not found (pod: %s, container: %s)", pod.Name, container.Name)
 				break
 			}
 
 			containerID, err := findContainerIDByName(&status, container.Name)
 			if err != nil {
-				glog.Warningf("[cpumanager] reconcileState: skipping container; ID not found in status (pod: %s, container: %s, error: %v)", pod.Name, container.Name, err)
+				glog.Errorf("[cpumanager] reconcileState: skipping container; ID not found in status (pod: %s, container: %s, error: %v)", pod.Name, container.Name, err)
 				continue
 			}
 
 			cset := m.state.GetCPUSetOrDefault(containerID)
 			if cset.IsEmpty() {
-				glog.Infof("[cpumanager] reconcileState: skipping container; assigned cpuset is empty (pod: %s, container: %s)", pod.Name, container.Name)
+				glog.Errorf("[cpumanager] reconcileState: skipping container; assigned cpuset is empty (pod: %s, container: %s)", pod.Name, container.Name)
 				continue
 			}
 
